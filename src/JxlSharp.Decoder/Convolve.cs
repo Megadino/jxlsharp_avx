@@ -377,7 +377,7 @@ namespace JxlSharp.Decoder
                     Span<float> rowOut = outRect.Row(output, riy);
                     bool mirrorY       = iy < 2 || iy >= inH - 2;
 
-                    Symmetric5Row(input, inRect, iy, mirrorY, weights, rowOut);
+                    Symmetric5Row(input, inRect, iy, mirrorY, weights, rowOut, !ReferenceEquals(input, output));
 
                     return true;
                 },
@@ -512,15 +512,56 @@ namespace JxlSharp.Decoder
             long iy,
             bool mirrorY,
             WeightsSymmetric5 weights,
-            Span<float> rowOut)
+            Span<float> rowOut,
+            bool separateOutput)
         {
-            nuint xend = (nuint)rect.X1;
-            nuint rix  = 0;
-
-            for (nuint ix = (nuint)rect.X0; ix < xend; ++ix, ++rix)
+            int first = rect.X0;
+            int end = rect.X1;
+            int x = first;
+            if (Avx2.IsSupported && separateOutput)
             {
-                rowOut[(int)rix] = Symmetric5Border(input, (long)ix, iy, mirrorY, weights);
+                int start = Math.Min(end, Math.Max(first, 2));
+                for (; x < start; x++)
+                    rowOut[x - first] = Symmetric5Border(input, x, iy, mirrorY, weights);
+                int vectorEnd = Math.Min(end, checked((int)input.xsize) - 2);
+                if (x + 8 <= vectorEnd)
+                {
+                    long height = (long)input.ysize;
+                    ReadOnlySpan<float> center = input.ConstRow((nuint)iy);
+                    ReadOnlySpan<float> m2 = input.ConstRow((nuint)ImageOps.Mirror(iy - 2, height));
+                    ReadOnlySpan<float> m1 = input.ConstRow((nuint)ImageOps.Mirror(iy - 1, height));
+                    ReadOnlySpan<float> p1 = input.ConstRow((nuint)ImageOps.Mirror(iy + 1, height));
+                    ReadOnlySpan<float> p2 = input.ConstRow((nuint)ImageOps.Mirror(iy + 2, height));
+                    var wc = Vector256.Create(weights.C[0]);
+                    var wr = Vector256.Create(weights.r[0]);
+                    var wR = Vector256.Create(weights.R[0]);
+                    var wd = Vector256.Create(weights.d[0]);
+                    var wD = Vector256.Create(weights.D[0]);
+                    var wL = Vector256.Create(weights.L[0]);
+                    for (; x + 8 <= vectorEnd; x += 8)
+                    {
+                        // Keep the scalar grouping and row accumulation order exactly.
+                        Vector256<float> sum0 = WeightedSum8(center, x, wc, wr, wR);
+                        Vector256<float> sum1 = WeightedSum8(p2, x, wR, wL, wD);
+                        sum0 += WeightedSum8(m2, x, wR, wL, wD);
+                        sum0 += WeightedSum8(m1, x, wr, wd, wL);
+                        sum1 += WeightedSum8(p1, x, wr, wd, wL);
+                        (sum0 + sum1).CopyTo(rowOut.Slice(x - first));
+                    }
+                }
             }
+            for (; x < end; x++)
+                rowOut[x - first] = Symmetric5Border(input, x, iy, mirrorY, weights);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> WeightedSum8(ReadOnlySpan<float> row, int x,
+            Vector256<float> w0, Vector256<float> w1, Vector256<float> w2)
+        {
+            Vector256<float> sum2 = w2 * (Vector256.Create(row.Slice(x - 2, 8)) + Vector256.Create(row.Slice(x + 2, 8)));
+            Vector256<float> sum1 = w1 * (Vector256.Create(row.Slice(x - 1, 8)) + Vector256.Create(row.Slice(x + 1, 8)));
+            Vector256<float> sum0 = w0 * Vector256.Create(row.Slice(x, 8));
+            return sum2 + (sum1 + sum0);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

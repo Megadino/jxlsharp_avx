@@ -1221,7 +1221,8 @@ namespace JxlSharp.Extras
                         },
                         frame.Color);
 
-                    if (cbStatus != JxlDecoderStatus.Success)
+                    if (cbStatus != JxlDecoderStatus.Success ||
+                        Dec.SetImageOutCallbackBuffer(frame.Color.PixelsBuffer) != JxlDecoderStatus.Success)
                     {
                         return false;
                     }

@@ -615,6 +615,13 @@ namespace JxlSharp.Decoder
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public static void ComputeScaledIDCT(int rows, int cols, Span<float> from, DctTo to, Span<float> scratchSpace)
         {
+            if (rows == 8 && cols == 8 &&
+                System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported &&
+                !from.Overlaps(to.Data) && !scratchSpace.Overlaps(from) && !scratchSpace.Overlaps(to.Data))
+            {
+                Inverse8x8Simd(from, to);
+                return;
+            }
             Span<float> block = scratchSpace;
             Span<float> tmp   = scratchSpace.Slice(rows * cols);
             nuint uRows       = (nuint)rows;

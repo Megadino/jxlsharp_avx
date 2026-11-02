@@ -288,6 +288,8 @@ namespace JxlSharp.Decoder
         private readonly uint[] _specialDistances = new uint[KNumSpecialDistances];
         private uint _numSpecialDistances;
 
+        internal bool UsesPrefixCode => _usePrefixCode;
+
         /// <summary>
         /// Snapshot of an <see cref="ANSSymbolReader"/> state for speculative decoding or rollback.
         /// </summary>
@@ -412,14 +414,15 @@ namespace JxlSharp.Decoder
         public static uint ReadHybridUintConfig(in HybridUintConfig config, nuint token, BitReader br)
         {
             nuint splitToken    = config.SplitToken;
-            nuint msbInToken    = config.MsbInToken;
-            nuint lsbInToken    = config.LsbInToken;
-            nuint splitExponent = config.SplitExponent;
 
             if (token < splitToken)
             {
                 return (uint)token;
             }
+
+            nuint msbInToken    = config.MsbInToken;
+            nuint lsbInToken    = config.LsbInToken;
+            nuint splitExponent = config.SplitExponent;
 
             uint nbits = (uint)splitExponent - (uint)(msbInToken + lsbInToken) +
                          ((uint)(token - splitToken) >> (int)(msbInToken + lsbInToken));
@@ -446,21 +449,25 @@ namespace JxlSharp.Decoder
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public nuint ReadSymbolANSWithoutRefill(nuint histoIdx, BitReader br)
         {
-            uint res                 = _state & (uint)AnsParams.AnsTabMask;
-            AliasTable.Symbol symbol = AliasTable.LookupAtOffset(
-                _aliasTables,
-                histoIdx << (int)_logAlphaSize,
-                res,
-                _logEntrySize,
-                _entrySizeMinus1);
-            _state                   = ((uint)symbol.Freq * (_state >> (int)AnsParams.AnsLogTabSize)) + (uint)symbol.Offset;
+            uint res = _state & (uint)AnsParams.AnsTabMask;
+            uint index = res >> (int)_logEntrySize;
+            uint position = res & _entrySizeMinus1;
+            ref readonly AliasTable.Entry entry = ref _aliasTables[(int)((histoIdx << (int)_logAlphaSize) + index)];
+            // Keep the three alias-table results in 32-bit registers instead of
+            // materializing a Symbol (three native-size fields) in the hot loop.
+            uint mask = position >= entry.Cutoff ? uint.MaxValue : 0u;
+            uint value = index ^ ((index ^ entry.RightValue) & mask);
+            uint offset = position + (entry.Offsets1 & mask);
+            uint frequency = entry.Freq0 ^ (entry.Freq1XorFreq0 & mask);
+            _state = frequency * (_state >> (int)AnsParams.AnsLogTabSize) + offset;
 
-            uint newState  = (_state << 16) | (uint)br.PeekFixedBits(16);
-            bool normalize = _state < (1u << 16);
-            _state         = normalize ? newState : _state;
-            br.Consume(normalize ? 16u : 0u);
+            if (_state < (1u << 16))
+            {
+                _state = (_state << 16) | (uint)br.PeekFixedBits(16);
+                br.Consume(16u);
+            }
 
-            return symbol.Value;
+            return value;
         }
 
         /// <summary>
@@ -631,6 +638,15 @@ namespace JxlSharp.Decoder
         public uint ReadHybridUintInlined(bool usesLz77, nuint ctx, BitReader br, ReadOnlySpan<byte> contextMap)
         {
             return ReadHybridUintClustered(usesLz77, contextMap[(int)ctx], br);
+        }
+
+        // The AC loop selects this path once per block, only for ANS without LZ77.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal uint ReadHybridUintANS(nuint ctx, BitReader br)
+        {
+            br.Refill();
+            nuint token = ReadSymbolANSWithoutRefill(ctx, br);
+            return ReadHybridUintConfig(in _configs[(int)ctx], token, br);
         }
 
         /// <summary>

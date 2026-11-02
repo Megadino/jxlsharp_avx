@@ -122,6 +122,23 @@ namespace JxlSharp.Base
             Vector256<float> r5 = Vector256.Create(from.Slice(5 * fromStride, 8));
             Vector256<float> r6 = Vector256.Create(from.Slice(6 * fromStride, 8));
             Vector256<float> r7 = Vector256.Create(from.Slice(7 * fromStride, 8));
+            Transpose8x8Vectors(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+            r0.CopyTo(to.Slice(0 * toStride, 8));
+            r1.CopyTo(to.Slice(1 * toStride, 8));
+            r2.CopyTo(to.Slice(2 * toStride, 8));
+            r3.CopyTo(to.Slice(3 * toStride, 8));
+            r4.CopyTo(to.Slice(4 * toStride, 8));
+            r5.CopyTo(to.Slice(5 * toStride, 8));
+            r6.CopyTo(to.Slice(6 * toStride, 8));
+            r7.CopyTo(to.Slice(7 * toStride, 8));
+        }
+
+        // AVX callers can retain the tile in registers between surrounding transforms.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void Transpose8x8Vectors(ref Vector256<float> r0, ref Vector256<float> r1,
+            ref Vector256<float> r2, ref Vector256<float> r3, ref Vector256<float> r4,
+            ref Vector256<float> r5, ref Vector256<float> r6, ref Vector256<float> r7)
+        {
             Vector256<float> t0 = Avx.UnpackLow(r0, r1);
             Vector256<float> t1 = Avx.UnpackHigh(r0, r1);
             Vector256<float> t2 = Avx.UnpackLow(r2, r3);
@@ -138,14 +155,14 @@ namespace JxlSharp.Base
             Vector256<float> u5 = Avx.Shuffle(t4, t6, 0xee);
             Vector256<float> u6 = Avx.Shuffle(t5, t7, 0x44);
             Vector256<float> u7 = Avx.Shuffle(t5, t7, 0xee);
-            Avx.Permute2x128(u0, u4, 0x20).CopyTo(to.Slice(0 * toStride, 8));
-            Avx.Permute2x128(u1, u5, 0x20).CopyTo(to.Slice(1 * toStride, 8));
-            Avx.Permute2x128(u2, u6, 0x20).CopyTo(to.Slice(2 * toStride, 8));
-            Avx.Permute2x128(u3, u7, 0x20).CopyTo(to.Slice(3 * toStride, 8));
-            Avx.Permute2x128(u0, u4, 0x31).CopyTo(to.Slice(4 * toStride, 8));
-            Avx.Permute2x128(u1, u5, 0x31).CopyTo(to.Slice(5 * toStride, 8));
-            Avx.Permute2x128(u2, u6, 0x31).CopyTo(to.Slice(6 * toStride, 8));
-            Avx.Permute2x128(u3, u7, 0x31).CopyTo(to.Slice(7 * toStride, 8));
+            r0 = Avx.Permute2x128(u0, u4, 0x20);
+            r1 = Avx.Permute2x128(u1, u5, 0x20);
+            r2 = Avx.Permute2x128(u2, u6, 0x20);
+            r3 = Avx.Permute2x128(u3, u7, 0x20);
+            r4 = Avx.Permute2x128(u0, u4, 0x31);
+            r5 = Avx.Permute2x128(u1, u5, 0x31);
+            r6 = Avx.Permute2x128(u2, u6, 0x31);
+            r7 = Avx.Permute2x128(u3, u7, 0x31);
         }
     }
 }

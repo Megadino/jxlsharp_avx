@@ -247,6 +247,27 @@ namespace JxlSharp.Decoder
             294337,   289262,  284359,  279620,  275036,  270600,  266305,  262144,
         };
 
+        private const int SmallErrorCount = 1024;
+        // Header weights occupy four bits. Share this 64 KiB table across all channels/frames.
+        private static readonly uint[] SmallErrorWeights = BuildSmallErrorWeights();
+
+        private static uint[] BuildSmallErrorWeights()
+        {
+            var table = new uint[16 * SmallErrorCount];
+            for (uint weight = 0; weight < 16; weight++)
+                for (uint error = 0; error < SmallErrorCount; error++)
+                    table[weight * SmallErrorCount + error] = ErrorWeight(error, weight);
+            return table;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static uint ErrorWeightCached(ulong error, uint weight)
+        {
+            if (error < SmallErrorCount && weight < 16)
+                return SmallErrorWeights[(int)(weight * SmallErrorCount + error)];
+            return ErrorWeight(error, weight);
+        }
+
         private readonly nuint _xsize;
         private readonly int _stride;
         private readonly uint[] _predErrors0;
@@ -410,10 +431,10 @@ namespace JxlSharp.Decoder
             int posNE   = x < xsize - 1u ? posN + 1 : posN;
             int posNW   = x > 0 ? posN - 1 : posN;
 
-            uint w0 = ErrorWeight(_predErrors0[posN] + _predErrors0[posNE] + _predErrors0[posNW], _w0);
-            uint w1 = ErrorWeight(_predErrors1[posN] + _predErrors1[posNE] + _predErrors1[posNW], _w1);
-            uint w2 = ErrorWeight(_predErrors2[posN] + _predErrors2[posNE] + _predErrors2[posNW], _w2);
-            uint w3 = ErrorWeight(_predErrors3[posN] + _predErrors3[posNE] + _predErrors3[posNW], _w3);
+            uint w0 = ErrorWeightCached(_predErrors0[posN] + _predErrors0[posNE] + _predErrors0[posNW], _w0);
+            uint w1 = ErrorWeightCached(_predErrors1[posN] + _predErrors1[posNE] + _predErrors1[posNW], _w1);
+            uint w2 = ErrorWeightCached(_predErrors2[posN] + _predErrors2[posNE] + _predErrors2[posNW], _w2);
+            uint w3 = ErrorWeightCached(_predErrors3[posN] + _predErrors3[posNE] + _predErrors3[posNW], _w3);
 
             long n  = AddBits(neighbors.Top);
             long w  = AddBits(neighbors.Left);
