@@ -12,6 +12,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using JxlSharp.Base;
 using JxlSharp.Cms;
@@ -791,6 +793,9 @@ namespace JxlSharp.Decoder
 
         /// <summary>Length of a row of <see cref="Buffer"/> in bytes (based on oriented width).</summary>
         public nuint Stride;
+
+        // Only trusted internal callbacks may share their own output buffer with the writer.
+        internal bool CallbackBuffer;
     }
 
     /// <summary>
@@ -1393,6 +1398,25 @@ namespace JxlSharp.Decoder
                 return false;
             }
 
+            // The terminal RGB8 writer can consume linear sRGB directly, avoiding
+            // a separate transfer-function pass and three intermediate plane writes.
+            if (linear && MainOutput.Format.DataType == JxlDataType.UInt8 &&
+                MainOutput.Format.NumChannels == 3 && MainOutput.BitsPerSample == 8 &&
+                UndoOrientation == Orientation.Identity &&
+                (MainOutput.Callback.IsPresent() || !MainOutput.Buffer.IsEmpty) &&
+                OutputEncodingInfo.ColorEncoding.Tf.IsSRGB() &&
+                OutputEncodingInfo.ColorEncoding.Channels() == 3 &&
+                OutputEncodingInfo.OrigColorEncoding.Channels() == 3 &&
+                (OutputEncodingInfo.ColorEncodingIsOriginal || !OutputEncodingInfo.CmsSet))
+            {
+                XybStage? xybStage = builder.RemoveLastStage<XybStage>();
+                OpsinParams? xybParams = xybStage?.OpsinParameters;
+                xybStage?.Dispose();
+                return builder.AddStage(RenderPipelineStages.GetWriteLinearSrgb8Stage(
+                    MainOutput, (Width, Height),
+                    (alphaInfo.HasAlpha, UnpremulAlpha, alphaInfo.AlphaC), ExtraOutput, MemoryManager, xybParams));
+            }
+
             if (!AddFinalColorConversionStages(builder, ref linear))
             {
                 return false;
@@ -1874,6 +1898,13 @@ namespace JxlSharp.Decoder
                 extraOutput,
                 memoryManager);
         }
+
+        internal static RenderPipelineStage GetWriteLinearSrgb8Stage(
+            ImageOutput mainOutput, (nuint Width, nuint Height) dimensions,
+            (bool HasAlpha, bool UnpremulAlpha, nuint AlphaC) alphaInfo,
+            IReadOnlyList<ImageOutput> extraOutput, JxlMemoryManager? memoryManager, OpsinParams? xybParams = null) =>
+            new WriteToOutputStage(mainOutput, dimensions, alphaInfo, Orientation.Identity,
+                extraOutput, memoryManager, linearSrgb8: true, xybParams);
 
         // --------------------------------------------------------------------
         // 15. Blending Stage (stage_blending.cc)
@@ -2413,7 +2444,7 @@ namespace JxlSharp.Decoder
         };
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static byte MakeUnsigned8(float v, nuint x, nuint y, float mul, nuint c)
+        internal static byte MakeUnsigned8(float v, nuint x, nuint y, float mul, nuint c)
         {
             v *= mul;
             nuint xOff = (x + c * 23) & 31u;
@@ -2422,6 +2453,31 @@ namespace JxlSharp.Decoder
             v  = Math.Clamp(v, 0.0f, mul);
 
             return (byte)MathF.Round(v, MidpointRounding.ToEven);
+        }
+
+        internal static Vector256<uint> QuantizeDither8(ReadOnlySpan<float> values,
+            nuint x, nuint y, float mul, nuint channel)
+        {
+            if (!Avx2.IsSupported)
+            {
+                Span<uint> scalar = stackalloc uint[8];
+                for (int i = 0; i < 8; i++) scalar[i] = MakeUnsigned8(values[i], x + (nuint)i, y, mul, channel);
+                return Vector256.Create(scalar);
+            }
+            return QuantizeDither8(Vector256.Create(values.Slice(0, 8)), x, y, mul, channel);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<uint> QuantizeDither8(Vector256<float> values,
+            nuint x, nuint y, float mul, nuint channel)
+        {
+            int xOffset = (int)((x + channel * 23) & 31u);
+            int rowOffset = (int)(((y + channel * 13) & 31u) * 48u);
+            // Every dither row repeats its first sixteen samples after the 32-pixel period.
+            var scaled = values * Vector256.Create(mul);
+            scaled += Vector256.Create(KDither.AsSpan(rowOffset + xOffset, 8));
+            var clipped = Avx.Min(Avx.Max(scaled, Vector256<float>.Zero), Vector256.Create(mul));
+            return Avx.ConvertToVector256Int32WithTruncation(Avx.RoundToNearestInteger(clipped)).AsUInt32();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2440,6 +2496,7 @@ namespace JxlSharp.Decoder
             {
                 public readonly PixelCallback PixelCallback;
                 public readonly Memory<byte> Buffer;
+                public readonly bool CallbackBuffer;
                 public readonly nuint BufferSize;
                 public readonly nuint Stride;
                 public readonly nuint NumChannels;
@@ -2453,6 +2510,7 @@ namespace JxlSharp.Decoder
                 {
                     PixelCallback  = imageOut.Callback;
                     Buffer         = imageOut.Buffer;
+                    CallbackBuffer = imageOut.CallbackBuffer;
                     BufferSize     = imageOut.BufferSize;
                     Stride         = imageOut.Stride;
                     NumChannels    = imageOut.Format.NumChannels;
@@ -2494,6 +2552,8 @@ namespace JxlSharp.Decoder
             private readonly bool _flipX;
             private readonly bool _flipY;
             private readonly bool _transpose;
+            private readonly bool _linearSrgb8;
+            private readonly OpsinParams? _xybParams;
             private readonly List<Output> _extraChannels = new List<Output>();
             private readonly float[] _opaqueAlpha;
             private readonly JxlMemoryManager _memoryManager;
@@ -2507,7 +2567,9 @@ namespace JxlSharp.Decoder
                 (bool HasAlpha, bool UnpremulAlpha, nuint AlphaC) alphaInfo,
                 Orientation undoOrientation,
                 IReadOnlyList<ImageOutput> extraOutput,
-                JxlMemoryManager? memoryManager)
+                JxlMemoryManager? memoryManager,
+                bool linearSrgb8 = false,
+                OpsinParams? xybParams = null)
                 : base(new Settings())
             {
                 _width         = dimensions.Width;
@@ -2521,6 +2583,8 @@ namespace JxlSharp.Decoder
                 _flipX         = ShouldFlipX(undoOrientation);
                 _flipY         = ShouldFlipY(undoOrientation);
                 _transpose     = ShouldTranspose(undoOrientation);
+                _linearSrgb8   = linearSrgb8;
+                _xybParams     = xybParams;
                 _opaqueAlpha   = new float[KChunkSize];
                 Array.Fill(_opaqueAlpha, 1.0f);
                 _memoryManager = memoryManager ?? JxlMemoryManager.Default;
@@ -2637,7 +2701,7 @@ namespace JxlSharp.Decoder
                 return RenderPipelineChannelMode.Ignored;
             }
 
-            public override string GetName() => "WritePixelCB";
+            public override string GetName() => _linearSrgb8 ? "WriteSrgb8" : "WritePixelCB";
 
             public override void Dispose()
             {
@@ -2760,17 +2824,32 @@ namespace JxlSharp.Decoder
                     FlipX(output, threadId, len, ref xstart, input);
                 }
 
+                bool direct = !_transpose && !output.Buffer.IsEmpty &&
+                    (output.RunOpaque == null || output.CallbackBuffer) &&
+                    output.DataType is JxlDataType.UInt8 or JxlDataType.UInt16 or JxlDataType.Float16 or JxlDataType.Float;
+                int elementBytes = output.DataType == JxlDataType.UInt8 ? 1 :
+                    output.DataType == JxlDataType.Float ? 4 : 2;
+                Span<byte> destination = default;
+                if (direct)
+                {
+                    int byteCount = checked((int)(len * output.NumChannels * (nuint)elementBytes));
+                    int offset = checked((int)(ypos * output.Stride + xstart * output.NumChannels * (nuint)elementBytes));
+                    destination = output.Buffer.Span.Slice(offset, byteCount);
+                }
                 Span<float> tempFloat = _tempOut[threadId].AsSpan();
 
                 if (output.DataType == JxlDataType.UInt8)
                 {
-                    Span<byte> temp = MemoryMarshal.AsBytes(tempFloat);
-                    StoreUnsigned8Row(output, input, len, temp, xstart, ypos);
-                    WriteToOutput(output, threadId, ypos, xstart, len, temp, 1u);
+                    Span<byte> temp = direct ? destination : MemoryMarshal.AsBytes(tempFloat);
+                    if (_linearSrgb8 && ReferenceEquals(output, _main))
+                        StoreLinearSrgb8Row(input, len, temp, xstart, ypos);
+                    else
+                        StoreUnsigned8Row(output, input, len, temp, xstart, ypos);
+                    FinishOutput(output, threadId, ypos, xstart, len, temp, 1u, direct);
                 }
                 else if (output.DataType == JxlDataType.UInt16 || output.DataType == JxlDataType.Float16)
                 {
-                    Span<ushort> temp = MemoryMarshal.Cast<float, ushort>(tempFloat);
+                    Span<ushort> temp = direct ? MemoryMarshal.Cast<byte, ushort>(destination) : MemoryMarshal.Cast<float, ushort>(tempFloat);
 
                     if (output.DataType == JxlDataType.UInt16)
                     {
@@ -2791,11 +2870,11 @@ namespace JxlSharp.Decoder
                         }
                     }
 
-                    WriteToOutput(output, threadId, ypos, xstart, len, temp, 2u);
+                    FinishOutput(output, threadId, ypos, xstart, len, temp, 2u, direct);
                 }
                 else if (output.DataType == JxlDataType.Float)
                 {
-                    Span<float> temp = tempFloat;
+                    Span<float> temp = direct ? MemoryMarshal.Cast<byte, float>(destination) : tempFloat;
                     StoreFloatRow(output, input, len, temp);
 
                     if (output.SwapEndianness)
@@ -2808,7 +2887,7 @@ namespace JxlSharp.Decoder
                         }
                     }
 
-                    WriteToOutput(output, threadId, ypos, xstart, len, temp, 4u);
+                    FinishOutput(output, threadId, ypos, xstart, len, temp, 4u, direct);
                 }
             }
 
@@ -2853,6 +2932,63 @@ namespace JxlSharp.Decoder
                 xstart = _width - xstart - len;
             }
 
+            private void StoreLinearSrgb8Row(PipelineRow[] input, nuint len,
+                Span<byte> dst, nuint xstart, nuint ypos)
+            {
+                int n = (int)len;
+                int done = 0;
+                if (Avx2.IsSupported)
+                {
+                    for (; done + 8 <= n; done += 8)
+                    {
+                        nuint x = xstart + (nuint)done;
+                        var r = Vector256.Create(input[0].AsSpan(done, 8));
+                        var g = Vector256.Create(input[1].AsSpan(done, 8));
+                        var b = Vector256.Create(input[2].AsSpan(done, 8));
+                        if (_xybParams != null)
+                            DecXyb.XybToRgb(r, g, b, _xybParams, out r, out g, out b);
+                        r = TfSrgb.FastLinearToSrgb(r);
+                        g = TfSrgb.FastLinearToSrgb(g);
+                        b = TfSrgb.FastLinearToSrgb(b);
+                        r = QuantizeDither8(r, x, ypos, 255f, 0).AsSingle();
+                        g = QuantizeDither8(g, x, ypos, 255f, 1).AsSingle();
+                        b = QuantizeDither8(b, x, ypos, 255f, 2).AsSingle();
+                        PixelPacking.Interleave3(r, g, b, out var p0, out var p1, out var p2);
+                        Span<byte> target = dst.Slice(done * 3);
+                        PixelPacking.StoreSamples(p0, target, 1, false, true);
+                        PixelPacking.StoreSamples(p1, target.Slice(8), 1, false, true);
+                        PixelPacking.StoreSamples(p2, target.Slice(16), 1, false, true);
+                    }
+                }
+                // The original XYB stage handles four lanes before its scalar tail.
+                // Retain that arithmetic path even when AVX2 is unavailable.
+                if (_xybParams != null)
+                    for (; done + 4 <= n; done += 4)
+                    {
+                        var r = Vector128.Create(input[0].AsSpan(done, 4));
+                        var g = Vector128.Create(input[1].AsSpan(done, 4));
+                        var b = Vector128.Create(input[2].AsSpan(done, 4));
+                        DecXyb.XybToRgb(r, g, b, _xybParams, out r, out g, out b);
+                        for (int lane = 0; lane < 4; lane++)
+                        {
+                            nuint x = xstart + (nuint)(done + lane);
+                            dst[(done + lane) * 3] = MakeUnsigned8(TfSrgb.FastLinearToSrgb(r.GetElement(lane)), x, ypos, 255f, 0);
+                            dst[(done + lane) * 3 + 1] = MakeUnsigned8(TfSrgb.FastLinearToSrgb(g.GetElement(lane)), x, ypos, 255f, 1);
+                            dst[(done + lane) * 3 + 2] = MakeUnsigned8(TfSrgb.FastLinearToSrgb(b.GetElement(lane)), x, ypos, 255f, 2);
+                        }
+                    }
+                for (; done < n; done++)
+                {
+                    nuint x = xstart + (nuint)done;
+                    float r = input[0][done], g = input[1][done], b = input[2][done];
+                    if (_xybParams != null)
+                        DecXyb.XybToRgbScalar(r, g, b, _xybParams, out r, out g, out b);
+                    dst[done * 3] = MakeUnsigned8(TfSrgb.FastLinearToSrgb(r), x, ypos, 255f, 0);
+                    dst[done * 3 + 1] = MakeUnsigned8(TfSrgb.FastLinearToSrgb(g), x, ypos, 255f, 1);
+                    dst[done * 3 + 2] = MakeUnsigned8(TfSrgb.FastLinearToSrgb(b), x, ypos, 255f, 2);
+                }
+            }
+
             private static void StoreUnsigned8Row(
                 Output output,
                 PipelineRow[] input,
@@ -2865,13 +3001,37 @@ namespace JxlSharp.Decoder
                 nuint numCh = output.NumChannels;
                 int n       = (int)len;
 
+                int done = 0;
+                if (Avx2.IsSupported && numCh is 3 or 4)
+                {
+                    for (; done + 8 <= n; done += 8)
+                    {
+                        nuint x = xstart + (nuint)done;
+                        var r = QuantizeDither8(input[0].AsSpan(done, 8), x, ypos, mul, 0).AsSingle();
+                        var g = QuantizeDither8(input[1].AsSpan(done, 8), x, ypos, mul, 1).AsSingle();
+                        var b = QuantizeDither8(input[2].AsSpan(done, 8), x, ypos, mul, 2).AsSingle();
+                        Vector256<float> p0, p1, p2, p3 = default;
+                        if (numCh == 3) PixelPacking.Interleave3(r, g, b, out p0, out p1, out p2);
+                        else
+                        {
+                            var a = QuantizeDither8(input[3].AsSpan(done, 8), x, ypos, mul, 3).AsSingle();
+                            PixelPacking.Interleave4(r, g, b, a, out p0, out p1, out p2, out p3);
+                        }
+                        Span<byte> target = dst.Slice(done * (int)numCh);
+                        PixelPacking.StoreSamples(p0, target, 1, false, true);
+                        PixelPacking.StoreSamples(p1, target.Slice(8), 1, false, true);
+                        PixelPacking.StoreSamples(p2, target.Slice(16), 1, false, true);
+                        if (numCh == 4) PixelPacking.StoreSamples(p3, target.Slice(24), 1, false, true);
+                    }
+                }
+
                 if (numCh == 3)
                 {
                     ReadOnlySpan<float> r0 = input[0].AsSpan(0, n);
                     ReadOnlySpan<float> r1 = input[1].AsSpan(0, n);
                     ReadOnlySpan<float> r2 = input[2].AsSpan(0, n);
 
-                    for (int i = 0; i < n; ++i)
+                    for (int i = done; i < n; ++i)
                     {
                         int baseIdx = i * 3;
                         nuint x     = xstart + (nuint)i;
@@ -2883,7 +3043,7 @@ namespace JxlSharp.Decoder
                     return;
                 }
 
-                for (nuint i = 0; i < len; ++i)
+                for (nuint i = (nuint)done; i < len; ++i)
                 {
                     int baseIdx = (int)(i * numCh);
 
@@ -2955,14 +3115,15 @@ namespace JxlSharp.Decoder
                     ReadOnlySpan<float> r1 = input[1].AsSpan(0, n);
                     ReadOnlySpan<float> r2 = input[2].AsSpan(0, n);
 
-                    for (int i = 0; i < n; ++i)
-                    {
-                        int baseIdx      = i * 3;
-                        dst[baseIdx]     = r0[i];
-                        dst[baseIdx + 1] = r1[i];
-                        dst[baseIdx + 2] = r2[i];
-                    }
+                    PixelPacking.Interleave3(r0, r1, r2, dst, n);
 
+                    return;
+                }
+
+                if (numCh == 4)
+                {
+                    PixelPacking.Interleave4(input[0].AsSpan(0, n), input[1].AsSpan(0, n),
+                        input[2].AsSpan(0, n), input[3].AsSpan(0, n), dst, n);
                     return;
                 }
 
@@ -2974,6 +3135,23 @@ namespace JxlSharp.Decoder
                     {
                         dst[baseIdx + (int)c] = input[c][(int)i];
                     }
+                }
+            }
+
+            private void FinishOutput<T>(Output output, nuint threadId, nuint ypos,
+                nuint xstart, nuint len, ReadOnlySpan<T> src, nuint elementSize, bool direct)
+                where T : struct
+            {
+                if (!direct)
+                {
+                    WriteToOutput(output, threadId, ypos, xstart, len, src, elementSize);
+                    return;
+                }
+                if (output.RunOpaque != null)
+                {
+                    // Preserve callback scheduling; its copy now has identical source/destination.
+                    ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(src.Slice(0, checked((int)(len * output.NumChannels))));
+                    output.PixelCallback.Run!(output.RunOpaque, threadId, xstart, ypos, len, bytes);
                 }
             }
 

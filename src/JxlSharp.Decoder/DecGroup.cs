@@ -7,6 +7,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using JxlSharp.Base;
 
 namespace JxlSharp.Decoder
@@ -222,6 +224,9 @@ namespace JxlSharp.Decoder
 
             ReadOnlySpan<uint> baseOrders = _coeffOrders.AsSpan((int)(_firstPass * _coeffOrderSize));
 
+            if (_numPasses == 1)
+                return LoadSinglePassBlock(bx, by, acs, log2CoveredBlocks, baseOrders, block, acType);
+
             foreach (int c in ChannelOrder)
             {
                 nuint sbx = bx >> (int)HShift[c];
@@ -249,6 +254,48 @@ namespace JxlSharp.Decoder
                 }
             }
 
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private Status LoadSinglePassBlock(nuint bx, nuint by, AcStrategy acs, nuint log2CoveredBlocks,
+            ReadOnlySpan<uint> orders, Span<ACPtr> block, ACType acType)
+        {
+            ANSSymbolReader decoder = Decoders[0];
+            DecGroup.AcVarBlockArgs args = new DecGroup.AcVarBlockArgs
+            {
+                CtxOffset = CtxOffset[0],
+                Log2CoveredBlocks = log2CoveredBlocks,
+                NzerosStride = _nzerosStride,
+                Lbx = bx,
+                Acs = acs,
+                CoeffOrder = orders,
+                Br = _readers[0]!,
+                Decoder = decoder,
+                ContextMap = _contextMap[(int)_firstPass],
+                QdcRow = _quantDcRow.Span,
+                QfRow = _qfRow.Span,
+                BlockCtxMap = _blockCtxMap!,
+                Shift = _shiftForPass[_firstPass],
+                AcType = acType,
+                UsesLz77 = decoder.UsesLZ77(),
+            };
+            foreach (int c in ChannelOrder)
+            {
+                nuint sbx = bx >> (int)HShift[c];
+                nuint sby = by >> (int)VShift[c];
+                if ((sbx << (int)HShift[c]) != bx || (sby << (int)VShift[c]) != by)
+                    continue;
+                args.C = (nuint)c;
+                args.Bx = sbx;
+                args.By = sby;
+                args.Block = block[c];
+                args.RowNzeros = RowNzeros[0, c].Span;
+                args.RowNzerosTop = RowNzerosTop[0, c].Span;
+                Status status = DecGroup.DecodeACVarBlock(in args);
+                if (!status.IsOk)
+                    return status;
+            }
             return true;
         }
 
@@ -858,7 +905,13 @@ namespace JxlSharp.Decoder
 
             nuint histoOffset = args.CtxOffset + args.BlockCtxMap.ZeroDensityContextsOffset((uint)blockCtx);
 
-            return ReadAcCoefficientsLoop(in args, coveredBlocks, size, order, histoOffset, nzeros);
+            if (!args.UsesLz77 && !args.Decoder.UsesPrefixCode)
+                return coveredBlocks == 1
+                    ? ReadAcCoefficientsLoop<AcAnsReader, Ac8x8Context>(in args, coveredBlocks, size, order, histoOffset, nzeros)
+                    : ReadAcCoefficientsLoop<AcAnsReader, AcVariableContext>(in args, coveredBlocks, size, order, histoOffset, nzeros);
+            return coveredBlocks == 1
+                ? ReadAcCoefficientsLoop<AcGeneralReader, Ac8x8Context>(in args, coveredBlocks, size, order, histoOffset, nzeros)
+                : ReadAcCoefficientsLoop<AcGeneralReader, AcVariableContext>(in args, coveredBlocks, size, order, histoOffset, nzeros);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -879,31 +932,78 @@ namespace JxlSharp.Decoder
             }
         }
 
+        private interface IAcSymbolReader
+        {
+            static abstract uint Read(ANSSymbolReader decoder, bool usesLz77, nuint context,
+                BitReader reader, ReadOnlySpan<byte> contextMap);
+        }
+
+        private readonly struct AcAnsReader : IAcSymbolReader
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public static uint Read(ANSSymbolReader decoder, bool usesLz77, nuint context,
+                BitReader reader, ReadOnlySpan<byte> contextMap) =>
+                decoder.ReadHybridUintANS(contextMap[(int)context], reader);
+        }
+
+        private readonly struct AcGeneralReader : IAcSymbolReader
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public static uint Read(ANSSymbolReader decoder, bool usesLz77, nuint context,
+                BitReader reader, ReadOnlySpan<byte> contextMap) =>
+                decoder.ReadHybridUintInlined(usesLz77, context, reader, contextMap);
+        }
+
+        private interface IAcContext
+        {
+            static abstract nuint Get(nuint nonzeros, nuint k, nuint coveredBlocks, nuint log2CoveredBlocks, nuint prev);
+        }
+
+        private readonly struct Ac8x8Context : IAcContext
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public static nuint Get(nuint nonzeros, nuint k, nuint coveredBlocks, nuint log2CoveredBlocks, nuint prev) =>
+                AcContext.ZeroDensityContext8x8(nonzeros, k, prev);
+        }
+
+        private readonly struct AcVariableContext : IAcContext
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public static nuint Get(nuint nonzeros, nuint k, nuint coveredBlocks, nuint log2CoveredBlocks, nuint prev) =>
+                AcContext.ZeroDensityContext(nonzeros, k, coveredBlocks, log2CoveredBlocks, prev);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private static Status ReadAcCoefficientsLoop(
+        private static Status ReadAcCoefficientsLoop<TReader, TContext>(
             in AcVarBlockArgs args,
             nuint coveredBlocks,
             nuint size,
             ReadOnlySpan<uint> order,
             nuint histoOffset,
-            nuint nzeros)
+            nuint nzeros) where TReader : struct, IAcSymbolReader
+                          where TContext : struct, IAcContext
         {
+            if (nzeros == 0) return true;
             nuint prev        = nzeros > (size / 16u) ? 0u : 1u;
             int shift         = (int)args.Shift;
             bool is16         = args.AcType == ACType.k16;
             Span<short> ptr16 = is16 ? args.Block.Span16 : Span<short>.Empty;
             Span<int> ptr32   = is16 ? Span<int>.Empty : args.Block.Span32;
             byte[] contextMap = args.ContextMap;
+            ANSSymbolReader decoder = args.Decoder;
+            BitReader reader = args.Br;
+            bool usesLz77 = args.UsesLz77;
+            nuint log2CoveredBlocks = args.Log2CoveredBlocks;
 
             for (nuint k = coveredBlocks; k < size && nzeros != 0; ++k)
             {
-                nuint ctx = histoOffset + AcContext.ZeroDensityContext(
+                nuint ctx = histoOffset + TContext.Get(
                     nzeros,
                     k,
                     coveredBlocks,
-                    args.Log2CoveredBlocks,
+                    log2CoveredBlocks,
                     prev);
-                uint uCoeff = args.Decoder.ReadHybridUintInlined(args.UsesLz77, ctx, args.Br, contextMap);
+                uint uCoeff = TReader.Read(decoder, usesLz77, ctx, reader, contextMap);
 
                 if (uCoeff == 0u)
                 {
@@ -928,8 +1028,8 @@ namespace JxlSharp.Decoder
                     ptr32[pos] += coeff;
                 }
 
-                prev    = uCoeff != 0u ? 1u : 0u;
-                nzeros -= prev;
+                prev = 1u;
+                nzeros--;
             }
 
             if (nzeros != 0)
@@ -1661,6 +1761,106 @@ namespace JxlSharp.Decoder
             }
         }
 
+        internal static void DequantizeCoefficients(ReadOnlySpan<ACPtr> qblock, ACType acType,
+            ReadOnlySpan<float> matrices, ReadOnlySpan<float> biases, Span<float> block,
+            int totalCoeffs, int size, (float X, float Y, float B) scales, (float X, float B) cfl)
+        {
+            float scaledDequantX = scales.X, scaledDequantY = scales.Y, scaledDequantB = scales.B;
+            float xCcMul = cfl.X, bCcMul = cfl.B;
+            bool is16                           = acType == ACType.k16;
+            ReadOnlySpan<short> q0_16           = is16 ? qblock[0].Span16 : ReadOnlySpan<short>.Empty;
+            ReadOnlySpan<short> q1_16           = is16 ? qblock[1].Span16 : ReadOnlySpan<short>.Empty;
+            ReadOnlySpan<short> q2_16           = is16 ? qblock[2].Span16 : ReadOnlySpan<short>.Empty;
+            ReadOnlySpan<int> q0_32             = is16 ? ReadOnlySpan<int>.Empty : qblock[0].Span32;
+            ReadOnlySpan<int> q1_32             = is16 ? ReadOnlySpan<int>.Empty : qblock[1].Span32;
+            ReadOnlySpan<int> q2_32             = is16 ? ReadOnlySpan<int>.Empty : qblock[2].Span32;
+
+            int k = 0;
+            if (Avx2.IsSupported && Fma.IsSupported)
+            {
+                var sx = Vector256.Create(scaledDequantX);
+                var sy = Vector256.Create(scaledDequantY);
+                var sb = Vector256.Create(scaledDequantB);
+                var cflX = Vector256.Create(xCcMul);
+                var cflB = Vector256.Create(bCcMul);
+                var biasX = Vector256.Create(biases[0]);
+                var biasY = Vector256.Create(biases[1]);
+                var biasB = Vector256.Create(biases[2]);
+                var numerator = Vector256.Create(biases[3]);
+                for (; k + 8 <= totalCoeffs; k += 8)
+                {
+                    Vector256<int> qx = is16 ? Avx2.ConvertToVector256Int32(Vector128.Create(q0_16.Slice(k, 8))) : Vector256.Create(q0_32.Slice(k, 8));
+                    Vector256<int> qy = is16 ? Avx2.ConvertToVector256Int32(Vector128.Create(q1_16.Slice(k, 8))) : Vector256.Create(q1_32.Slice(k, 8));
+                    Vector256<int> qb = is16 ? Avx2.ConvertToVector256Int32(Vector128.Create(q2_16.Slice(k, 8))) : Vector256.Create(q2_32.Slice(k, 8));
+                    var combined = qx | qy | qb;
+                    if (Vector256.EqualsAll(combined, Vector256<int>.Zero))
+                    {
+                        Vector256<float>.Zero.CopyTo(block.Slice(k));
+                        Vector256<float>.Zero.CopyTo(block.Slice(size + k));
+                        Vector256<float>.Zero.CopyTo(block.Slice(2 * size + k));
+                        continue;
+                    }
+                    var xMul = Vector256.Create(matrices.Slice(k, 8)) * sx;
+                    var yMul = Vector256.Create(matrices.Slice(size + k, 8)) * sy;
+                    var bMul = Vector256.Create(matrices.Slice(2 * size + k, 8)) * sb;
+                    var x = AdjustQuantBias8(qx, biasX, numerator) * xMul;
+                    var y = AdjustQuantBias8(qy, biasY, numerator) * yMul;
+                    var b = AdjustQuantBias8(qb, biasB, numerator) * bMul;
+                    // The scalar all-zero branch writes positive zero, regardless of matrix signs.
+                    var zero = Vector256.Equals(combined, Vector256<int>.Zero).AsSingle();
+                    Vector256.ConditionalSelect(zero, Vector256<float>.Zero, Fma.MultiplyAdd(cflX, y, x)).CopyTo(block.Slice(k));
+                    Vector256.ConditionalSelect(zero, Vector256<float>.Zero, y).CopyTo(block.Slice(size + k));
+                    Vector256.ConditionalSelect(zero, Vector256<float>.Zero, Fma.MultiplyAdd(cflB, y, b)).CopyTo(block.Slice(2 * size + k));
+                }
+            }
+            for (; k < totalCoeffs; k++)
+            {
+                int qx = is16 ? q0_16[k] : q0_32[k];
+                int qy = is16 ? q1_16[k] : q1_32[k];
+                int qb = is16 ? q2_16[k] : q2_32[k];
+
+                if ((qx | qy | qb) == 0)
+                {
+                    block[k]              = 0.0f;
+                    block[size + k]       = 0.0f;
+                    block[(2 * size) + k] = 0.0f;
+                    continue;
+                }
+
+                float xMul = matrices[k] * scaledDequantX;
+                float yMul = matrices[size + k] * scaledDequantY;
+                float bMul = matrices[(2 * size) + k] * scaledDequantB;
+
+                float dequantXCc = AdjustQuantBias(0, qx, biases) * xMul;
+                float dequantY   = AdjustQuantBias(1, qy, biases) * yMul;
+                float dequantBCc = AdjustQuantBias(2, qb, biases) * bMul;
+
+                block[k]              = MathF.FusedMultiplyAdd(xCcMul, dequantY, dequantXCc);
+                block[size + k]       = dequantY;
+                block[(2 * size) + k] = MathF.FusedMultiplyAdd(bCcMul, dequantY, dequantBCc);
+            }
+
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> AdjustQuantBias8(Vector256<int> quant,
+            Vector256<float> bias, Vector256<float> numerator)
+        {
+            var zero = Vector256.Equals(quant, Vector256<int>.Zero);
+            var negativeOne = Vector256.Equals(quant, Vector256.Create(-1));
+            var adjusted = Vector256.ConditionalSelect(negativeOne.AsSingle(), -bias, bias);
+            adjusted = Vector256.ConditionalSelect(zero.AsSingle(), Vector256<float>.Zero, adjusted);
+            var other = Vector256.GreaterThan(quant, Vector256.Create(1)) | Vector256.LessThan(quant, Vector256.Create(-1));
+            if (!Vector256.EqualsAll(other, Vector256<int>.Zero))
+            {
+                var value = Avx.ConvertToVector256Single(quant);
+                var denominator = Vector256.ConditionalSelect(zero.AsSingle(), Vector256.Create(1f), value);
+                var general = value - numerator / denominator;
+                adjusted = Vector256.ConditionalSelect(other.AsSingle(), general, adjusted);
+            }
+            return adjusted;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static void DequantBlock(in DequantBlockArgs args)
         {
@@ -1676,40 +1876,8 @@ namespace JxlSharp.Decoder
             ReadOnlySpan<float> biases          = args.Biases;
             float xCcMul                        = args.XCcMul;
             float bCcMul                        = args.BCcMul;
-            bool is16                           = args.AcType == ACType.k16;
-            ReadOnlySpan<short> q0_16           = is16 ? args.Qblock[0].Span16 : ReadOnlySpan<short>.Empty;
-            ReadOnlySpan<short> q1_16           = is16 ? args.Qblock[1].Span16 : ReadOnlySpan<short>.Empty;
-            ReadOnlySpan<short> q2_16           = is16 ? args.Qblock[2].Span16 : ReadOnlySpan<short>.Empty;
-            ReadOnlySpan<int> q0_32             = is16 ? ReadOnlySpan<int>.Empty : args.Qblock[0].Span32;
-            ReadOnlySpan<int> q1_32             = is16 ? ReadOnlySpan<int>.Empty : args.Qblock[1].Span32;
-            ReadOnlySpan<int> q2_32             = is16 ? ReadOnlySpan<int>.Empty : args.Qblock[2].Span32;
-
-            for (int k = 0; k < totalCoeffs; k++)
-            {
-                int qx = is16 ? q0_16[k] : q0_32[k];
-                int qy = is16 ? q1_16[k] : q1_32[k];
-                int qb = is16 ? q2_16[k] : q2_32[k];
-
-                if ((qx | qy | qb) == 0)
-                {
-                    block[k]              = 0.0f;
-                    block[size + k]       = 0.0f;
-                    block[(2 * size) + k] = 0.0f;
-                    continue;
-                }
-
-                float xMul = dequantMatrices[k] * scaledDequantX;
-                float yMul = dequantMatrices[size + k] * scaledDequantY;
-                float bMul = dequantMatrices[(2 * size) + k] * scaledDequantB;
-
-                float dequantXCc = AdjustQuantBias(0, qx, biases) * xMul;
-                float dequantY   = AdjustQuantBias(1, qy, biases) * yMul;
-                float dequantBCc = AdjustQuantBias(2, qb, biases) * bMul;
-
-                block[k]              = MathF.FusedMultiplyAdd(xCcMul, dequantY, dequantXCc);
-                block[size + k]       = dequantY;
-                block[(2 * size) + k] = MathF.FusedMultiplyAdd(bCcMul, dequantY, dequantBCc);
-            }
+            DequantizeCoefficients(args.Qblock, args.AcType, dequantMatrices, biases, block,
+                totalCoeffs, size, (scaledDequantX, scaledDequantY, scaledDequantB), (xCcMul, bCcMul));
 
             for (int c = 0; c < 3; c++)
             {

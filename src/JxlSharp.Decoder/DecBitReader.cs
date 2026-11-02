@@ -165,6 +165,8 @@ namespace JxlSharp.Decoder
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Refill()
         {
+            // No bytes can be absorbed until fewer than 56 bits remain.
+            if (_bitsInBuf >= 56u) return;
             if (_nextByte > _endMinus8)
             {
                 BoundsCheckedRefill();

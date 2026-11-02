@@ -347,5 +347,37 @@ namespace JxlSharp.Decoder
             r6.CopyTo(to.Slice(6, 0).Slice(0, 8));
             r7.CopyTo(to.Slice(7, 0).Slice(0, 8));
         }
+
+        private static void Inverse8x8Simd(Span<float> from, DctTo to)
+        {
+            Vector256<float> r0 = Vector256.Create(from.Slice(0, 8));
+            Vector256<float> r1 = Vector256.Create(from.Slice(8, 8));
+            Vector256<float> r2 = Vector256.Create(from.Slice(16, 8));
+            Vector256<float> r3 = Vector256.Create(from.Slice(24, 8));
+            Vector256<float> r4 = Vector256.Create(from.Slice(32, 8));
+            Vector256<float> r5 = Vector256.Create(from.Slice(40, 8));
+            Vector256<float> r6 = Vector256.Create(from.Slice(48, 8));
+            Vector256<float> r7 = Vector256.Create(from.Slice(56, 8));
+            Inverse8Simd(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+            JxlSharp.Base.Transpose.Transpose8x8Vectors(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+            // Preserve the mutable coefficient buffer's existing intermediate result.
+            r0.CopyTo(from.Slice(0, 8));
+            r1.CopyTo(from.Slice(8, 8));
+            r2.CopyTo(from.Slice(16, 8));
+            r3.CopyTo(from.Slice(24, 8));
+            r4.CopyTo(from.Slice(32, 8));
+            r5.CopyTo(from.Slice(40, 8));
+            r6.CopyTo(from.Slice(48, 8));
+            r7.CopyTo(from.Slice(56, 8));
+            Inverse8Simd(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+            r0.CopyTo(to.Slice(0, 0).Slice(0, 8));
+            r1.CopyTo(to.Slice(1, 0).Slice(0, 8));
+            r2.CopyTo(to.Slice(2, 0).Slice(0, 8));
+            r3.CopyTo(to.Slice(3, 0).Slice(0, 8));
+            r4.CopyTo(to.Slice(4, 0).Slice(0, 8));
+            r5.CopyTo(to.Slice(5, 0).Slice(0, 8));
+            r6.CopyTo(to.Slice(6, 0).Slice(0, 8));
+            r7.CopyTo(to.Slice(7, 0).Slice(0, 8));
+        }
     }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.Intrinsics;
 using JxlSharp.Base;
 using NUnit.Framework;
 
@@ -9,6 +10,34 @@ namespace JxlSharp.Decoder.Tests
     public sealed class SpatialFilterSimdTests
     {
         private const int Padding = 16;
+
+        /// <summary>Every block alignment preserves sigma selection, border weights and skip comparisons.</summary>
+        [Test]
+        public void SigmaVectorsMatchPerPixelPreparation()
+        {
+            float[] sigmas = new float[32];
+            float[] values = { -10f, -.5f, -2f, 0f, Epf.KMinSigma, float.NaN, float.PositiveInfinity };
+            for (int i = 0; i < sigmas.Length; i++) sigmas[i] = values[i % values.Length];
+            for (nuint y = 0; y < 16; y++)
+            for (nuint firstX = 0; firstX < 32; firstX++)
+            foreach (float sm in new[] { .7f, 1.65f, 4f })
+            {
+                float bsm = sm * .83f;
+                var row = new EpfStageHelpers.SigmaRow8(y, firstX, sm, bsm);
+                var sigma = row.Load(sigmas, firstX, out var mask);
+                var inverse = sigma * row.SadMul;
+                for (int lane = 0; lane < 8; lane++)
+                {
+                    nuint x = firstX + (nuint)lane;
+                    float s = sigmas[(int)((x + Epf.KSigmaPadding * FrameDimensions.KBlockDim) / FrameDimensions.KBlockDim)];
+                    Assert.That(mask.GetElement(lane), Is.EqualTo(s < Epf.KMinSigma ? -1 : 0));
+                    float expected = s * EpfStageHelpers.GetSadMul(y, x % FrameDimensions.KBlockDim, sm, bsm);
+                    if (float.IsNaN(expected)) Assert.That(float.IsNaN(inverse.GetElement(lane)), Is.True);
+                    else Assert.That(BitConverter.SingleToInt32Bits(inverse.GetElement(lane)),
+                        Is.EqualTo(BitConverter.SingleToInt32Bits(expected)));
+                }
+            }
+        }
 
         /// <summary>Compare full rows with the original four-lane Gaborish and scalar EPF paths.</summary>
         [TestCase(0)]

@@ -416,6 +416,44 @@ namespace JxlSharp.Decoder
     /// </summary>
     internal static class EpfStageHelpers
     {
+        // Every eight-pixel vector intersects at most two sigma blocks. Its
+        // horizontal border pattern stays constant for the entire row.
+        internal readonly struct SigmaRow8
+        {
+            private readonly Vector256<int> _nextBlockMask;
+            private readonly bool _spansBlocks;
+            internal readonly Vector256<float> SadMul;
+
+            internal SigmaRow8(nuint ypos, nuint firstX, float sm, float bsm)
+            {
+                int ix = (int)(firstX & 7u);
+                var lanes = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7);
+                _spansBlocks = ix != 0;
+                _nextBlockMask = Vector256.GreaterThanOrEqual(lanes, Vector256.Create(8 - ix));
+                nuint iy = ypos & 7u;
+                if (iy == 0 || iy == 7)
+                    SadMul = Vector256.Create(bsm);
+                else
+                {
+                    var position = (lanes + Vector256.Create(ix)) & Vector256.Create(7);
+                    var border = Vector256.Equals(position, Vector256<int>.Zero) |
+                                 Vector256.Equals(position, Vector256.Create(7));
+                    SadMul = Vector256.ConditionalSelect(border.AsSingle(), Vector256.Create(bsm), Vector256.Create(sm));
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal Vector256<float> Load(ReadOnlySpan<float> rowSigma, nuint absX, out Vector256<int> skip)
+            {
+                int bx = (int)((absX + Epf.KSigmaPadding * FrameDimensions.KBlockDim) / FrameDimensions.KBlockDim);
+                var sigma = Vector256.Create(rowSigma[bx]);
+                if (_spansBlocks)
+                    sigma = Vector256.ConditionalSelect(_nextBlockMask.AsSingle(), Vector256.Create(rowSigma[bx + 1]), sigma);
+                skip = Vector256.LessThan(sigma, Vector256.Create(Epf.KMinSigma)).AsInt32();
+                return sigma;
+            }
+        }
+
         public static readonly (int Row, int Col)[] SadsOffsets =
         {
             (-2, 0), (-1, -1), (-1, 0), (-1, 1), (0, -2), (0, -1),
@@ -516,21 +554,12 @@ namespace JxlSharp.Decoder
             PipelineRow out2             = GetOutputRow(outputRows, 2, 0);
 
             nint x = xStart;
-            Span<float> invSigmas = stackalloc float[8];
-            Span<int> skip = stackalloc int[8];
             if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
             {
+                var sigmaRow = new EpfStageHelpers.SigmaRow8(ypos, (nuint)(xStart + (nint)xpos), sm, bsm);
                 for (; x + 8 <= xEnd; x += 8)
                 {
-                    for (int lane = 0; lane < 8; lane++)
-                    {
-                        nuint absX = (nuint)(x + lane + (nint)xpos);
-                        nuint bx = (absX + Epf.KSigmaPadding * FrameDimensions.KBlockDim) / FrameDimensions.KBlockDim;
-                        float sigma = rowSigma[(int)bx];
-                        skip[lane] = sigma < Epf.KMinSigma ? -1 : 0;
-                        invSigmas[lane] = sigma * EpfStageHelpers.GetSadMul(ypos, absX % FrameDimensions.KBlockDim, sm, bsm);
-                    }
-                    Vector256<int> mask = Vector256.Create(skip);
+                    var sigma = sigmaRow.Load(rowSigma, (nuint)(x + (nint)xpos), out Vector256<int> mask);
                     if (Vector256.EqualsAll(mask, Vector256.Create(-1)))
                     {
                         Vector256.LoadUnsafe(ref GetInputRow(inputRows, 0, 0)[x]).StoreUnsafe(ref out0[x]);
@@ -538,7 +567,7 @@ namespace JxlSharp.Decoder
                         Vector256.LoadUnsafe(ref GetInputRow(inputRows, 2, 0)[x]).StoreUnsafe(ref out2[x]);
                         continue;
                     }
-                    FilterPixel(inputRows, x, Vector256.Create(invSigmas), out Vector256<float> vx, out Vector256<float> vy, out Vector256<float> vb);
+                    FilterPixel(inputRows, x, sigma * sigmaRow.SadMul, out Vector256<float> vx, out Vector256<float> vy, out Vector256<float> vb);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 0, 0)[x]), vx).StoreUnsafe(ref out0[x]);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 1, 0)[x]), vy).StoreUnsafe(ref out1[x]);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 2, 0)[x]), vb).StoreUnsafe(ref out2[x]);
@@ -718,21 +747,12 @@ namespace JxlSharp.Decoder
             PipelineRow out2             = GetOutputRow(outputRows, 2, 0);
 
             nint x = xStart;
-            Span<float> invSigmas = stackalloc float[8];
-            Span<int> skip = stackalloc int[8];
             if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
             {
+                var sigmaRow = new EpfStageHelpers.SigmaRow8(ypos, (nuint)(xStart + (nint)xpos), sm, bsm);
                 for (; x + 8 <= xEnd; x += 8)
                 {
-                    for (int lane = 0; lane < 8; lane++)
-                    {
-                        nuint absX = (nuint)(x + lane + (nint)xpos);
-                        nuint bx = (absX + Epf.KSigmaPadding * FrameDimensions.KBlockDim) / FrameDimensions.KBlockDim;
-                        float sigma = rowSigma[(int)bx];
-                        skip[lane] = sigma < Epf.KMinSigma ? -1 : 0;
-                        invSigmas[lane] = sigma * EpfStageHelpers.GetSadMul(ypos, absX % FrameDimensions.KBlockDim, sm, bsm);
-                    }
-                    Vector256<int> mask = Vector256.Create(skip);
+                    var sigma = sigmaRow.Load(rowSigma, (nuint)(x + (nint)xpos), out Vector256<int> mask);
                     if (Vector256.EqualsAll(mask, Vector256.Create(-1)))
                     {
                         Vector256.LoadUnsafe(ref GetInputRow(inputRows, 0, 0)[x]).StoreUnsafe(ref out0[x]);
@@ -740,7 +760,7 @@ namespace JxlSharp.Decoder
                         Vector256.LoadUnsafe(ref GetInputRow(inputRows, 2, 0)[x]).StoreUnsafe(ref out2[x]);
                         continue;
                     }
-                    FilterPixel(inputRows, x, Vector256.Create(invSigmas), out Vector256<float> vx, out Vector256<float> vy, out Vector256<float> vb);
+                    FilterPixel(inputRows, x, sigma * sigmaRow.SadMul, out Vector256<float> vx, out Vector256<float> vy, out Vector256<float> vb);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 0, 0)[x]), vx).StoreUnsafe(ref out0[x]);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 1, 0)[x]), vy).StoreUnsafe(ref out1[x]);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 2, 0)[x]), vb).StoreUnsafe(ref out2[x]);
@@ -995,21 +1015,12 @@ namespace JxlSharp.Decoder
             PipelineRow out2             = GetOutputRow(outputRows, 2, 0);
 
             nint x = xStart;
-            Span<float> invSigmas = stackalloc float[8];
-            Span<int> skip = stackalloc int[8];
             if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
             {
+                var sigmaRow = new EpfStageHelpers.SigmaRow8(ypos, (nuint)(xStart + (nint)xpos), sm, bsm);
                 for (; x + 8 <= xEnd; x += 8)
                 {
-                    for (int lane = 0; lane < 8; lane++)
-                    {
-                        nuint absX = (nuint)(x + lane + (nint)xpos);
-                        nuint bx = (absX + Epf.KSigmaPadding * FrameDimensions.KBlockDim) / FrameDimensions.KBlockDim;
-                        float sigma = rowSigma[(int)bx];
-                        skip[lane] = sigma < Epf.KMinSigma ? -1 : 0;
-                        invSigmas[lane] = sigma * EpfStageHelpers.GetSadMul(ypos, absX % FrameDimensions.KBlockDim, sm, bsm);
-                    }
-                    Vector256<int> mask = Vector256.Create(skip);
+                    var sigma = sigmaRow.Load(rowSigma, (nuint)(x + (nint)xpos), out Vector256<int> mask);
                     if (Vector256.EqualsAll(mask, Vector256.Create(-1)))
                     {
                         Vector256.LoadUnsafe(ref GetInputRow(inputRows, 0, 0)[x]).StoreUnsafe(ref out0[x]);
@@ -1017,7 +1028,7 @@ namespace JxlSharp.Decoder
                         Vector256.LoadUnsafe(ref GetInputRow(inputRows, 2, 0)[x]).StoreUnsafe(ref out2[x]);
                         continue;
                     }
-                    FilterPixel(inputRows, x, Vector256.Create(invSigmas), out Vector256<float> vx, out Vector256<float> vy, out Vector256<float> vb);
+                    FilterPixel(inputRows, x, sigma * sigmaRow.SadMul, out Vector256<float> vx, out Vector256<float> vy, out Vector256<float> vb);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 0, 0)[x]), vx).StoreUnsafe(ref out0[x]);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 1, 0)[x]), vy).StoreUnsafe(ref out1[x]);
                     Vector256.ConditionalSelect(mask.AsSingle(), Vector256.LoadUnsafe(ref GetInputRow(inputRows, 2, 0)[x]), vb).StoreUnsafe(ref out2[x]);
@@ -1923,6 +1934,7 @@ namespace JxlSharp.Decoder
     /// </summary>
     internal sealed class XybStage : RenderPipelineStage
     {
+        internal OpsinParams OpsinParameters => _opsinParams;
         private readonly OpsinParams _opsinParams;
         private readonly bool _outputIsXyb;
 
