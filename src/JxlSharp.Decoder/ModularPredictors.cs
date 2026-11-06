@@ -573,7 +573,7 @@ namespace JxlSharp.Decoder
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static long ComputeWpProperty(long teW, long teN, long teNW, long teNE)
+        internal static long ComputeWpProperty(long teW, long teN, long teNW, long teNE)
         {
             long p = teW;
 
@@ -594,6 +594,9 @@ namespace JxlSharp.Decoder
 
             return p;
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static uint NormalizedWeightReciprocal(uint weightSum) => DivLookup[(int)(weightSum - 1)];
     }
 
     /// <summary>

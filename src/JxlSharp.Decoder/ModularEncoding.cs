@@ -929,6 +929,26 @@ namespace JxlSharp.Decoder
                 return true;
             }
 
+            if (!usesLz77 && !treeHasWpPropOrPred)
+            {
+                ModularSmallTreeDecoder.Table? table = ModularSmallTreeDecoder.Compile(tree, staticProps);
+                if (table != null)
+                {
+                    if (state.Reader.UsesPrefixCode)
+                    {
+                        var reader = new ModularWpLutDecoder.PrefixReader(state.Reader, state.Br);
+                        ModularSmallTreeDecoder.Decode(channel, table, ref reader);
+                    }
+                    else
+                    {
+                        var reader = new ModularWpLutDecoder.AnsReader(state.Reader, state.Br);
+                        ModularSmallTreeDecoder.Decode(channel, table, ref reader);
+                        reader.Commit();
+                    }
+                    return true;
+                }
+            }
+
             return DecodeGeneralTreeChannel(state, channel, tree, staticProps, (int)numProps, treeHasWpPropOrPred, usesLz77);
         }
 
@@ -1101,34 +1121,16 @@ namespace JxlSharp.Decoder
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static void DecodeWpLutChannel(ChannelDecodeState state, Channel channel)
         {
-            WeightedState wpState = new WeightedState(state.WpHeader, channel.W, channel.H);
-            Span<int> properties  = stackalloc int[1];
-            byte[] lut            = state.TreeLut.ContextLookup;
-
-            for (nuint y = 0; y < channel.H; y++)
+            if (state.Reader.UsesPrefixCode)
             {
-                Span<int> r                 = channel.Row(y);
-                ReadOnlySpan<int> rowTop    = y > 0 ? channel.ConstRow(y - 1u) : r;
-                ReadOnlySpan<int> rowTopTop = y > 1 ? channel.ConstRow(y - 2u) : rowTop;
-
-                for (int x = 0; x < (int)channel.W; x++)
-                {
-                    NeighborPixels neighbors = ModularPredictors.GatherNeighbors(r, rowTop, rowTopTop, x, (int)y);
-                    int guess                = (int)wpState.Predict(
-                        (nuint)x,
-                        y,
-                        channel.W,
-                        in neighbors,
-                        properties,
-                        0,
-                        computeProperties: true);
-                    int pos     = TreeLut.KPropRangeFast +
-                                  Math.Clamp(properties[0], -TreeLut.KPropRangeFast, TreeLut.KPropRangeFast - 1);
-                    nuint ctxId = lut[pos];
-                    uint v      = state.Reader.ReadHybridUintClustered(usesLz77: false, ctxId, state.Br);
-                    r[x]        = MakePixel(v, 1, guess);
-                    wpState.UpdateErrors(r[x], (nuint)x, y, channel.W);
-                }
+                var reader = new ModularWpLutDecoder.PrefixReader(state.Reader, state.Br);
+                ModularWpLutDecoder.Decode(channel, state.WpHeader, state.TreeLut.ContextLookup, ref reader);
+            }
+            else
+            {
+                var reader = new ModularWpLutDecoder.AnsReader(state.Reader, state.Br);
+                ModularWpLutDecoder.Decode(channel, state.WpHeader, state.TreeLut.ContextLookup, ref reader);
+                reader.Commit();
             }
         }
 

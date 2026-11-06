@@ -649,6 +649,58 @@ namespace JxlSharp.Decoder
             return ReadHybridUintConfig(in _configs[(int)ctx], token, br);
         }
 
+        // A channel owns the no-LZ77 ANS state until Commit. Keeping it in a
+        // local value lets the fused Modular loop avoid a class-field roundtrip
+        // for every residual. Other readers must not run before Commit.
+        internal struct LocalAnsReader
+        {
+            private readonly ANSSymbolReader _owner;
+            private readonly BitReader _bits;
+            private readonly AliasTable.Entry[] _tables;
+            private readonly HybridUintConfig[] _configs;
+            private readonly int _logAlpha;
+            private readonly int _logEntry;
+            private readonly uint _entryMask;
+            private uint _state;
+
+            internal LocalAnsReader(ANSSymbolReader owner, BitReader bits)
+            {
+                _owner = owner;
+                _bits = bits;
+                _tables = owner._aliasTables;
+                _configs = owner._configs;
+                _logAlpha = (int)owner._logAlphaSize;
+                _logEntry = (int)owner._logEntrySize;
+                _entryMask = owner._entrySizeMinus1;
+                _state = owner._state;
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal uint Read(nuint context)
+            {
+                uint residual = _state & (uint)AnsParams.AnsTabMask;
+                uint index = residual >> _logEntry;
+                uint position = residual & _entryMask;
+                ref readonly AliasTable.Entry entry = ref _tables[(int)((context << _logAlpha) + index)];
+                uint mask = position >= entry.Cutoff ? uint.MaxValue : 0u;
+                uint token = index ^ ((index ^ entry.RightValue) & mask);
+                uint offset = position + (entry.Offsets1 & mask);
+                uint frequency = entry.Freq0 ^ (entry.Freq1XorFreq0 & mask);
+                _state = frequency * (_state >> (int)AnsParams.AnsLogTabSize) + offset;
+                if (_state < (1u << 16))
+                {
+                    _bits.Refill();
+                    _state = (_state << 16) | (uint)_bits.PeekFixedBits(16);
+                    _bits.Consume(16);
+                }
+                if (token < _configs[(int)context].SplitToken) return token;
+                _bits.Refill();
+                return ReadHybridUintConfig(in _configs[(int)context], token, _bits);
+            }
+
+            internal readonly void Commit() => _owner._state = _state;
+        }
+
         /// <summary>
         /// Reads a hybrid unsigned integer for unclustered context <paramref name="ctx"/> with LZ77 enabled.
         /// </summary>

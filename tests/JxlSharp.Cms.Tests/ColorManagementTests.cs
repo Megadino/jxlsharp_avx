@@ -4,8 +4,8 @@
 // license that can be found in the LICENSE file.
 
 using System;
-using System.IO;
 using JxlSharp.Base;
+using JxlSharp.TestLib;
 using NUnit.Framework;
 using Shouldly;
 
@@ -80,7 +80,7 @@ namespace JxlSharp.Cms.Tests
         [Test]
         public void D2700ChromaticityAndToSrgb()
         {
-            byte[] iccData = JxlSharp.TestLib.TestUtils.ReadTestData("jxl/color_management/sRGB-D2700.icc");
+            byte[] iccData = TestUtils.ReadTestData("jxl/color_management/sRGB-D2700.icc");
 
             CmsColorEncoding srgbD2700 = new CmsColorEncoding();
             srgbD2700.SetICC(iccData, JxlCms.GetDefaultCms()).IsOk.ShouldBeTrue();
